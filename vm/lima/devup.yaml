@@ -1,0 +1,49 @@
+# devup Lima VM config
+# Uses Ubuntu, mounts HOME at /mnt/host, forwards port 7777 for the agent
+base:
+  - template:_images/ubuntu
+  - template:_default/mounts
+
+cpus: 2
+memory: "2GiB"
+
+# Mount user HOME into VM at /mnt/host (rw) for project access
+mounts:
+  - location: "~"
+    mountPoint: "/mnt/host"
+    writable: true
+
+# Forward agent port: host 127.0.0.1:7777 -> guest 127.0.0.1:7777 (IPv4 loopback)
+# hostIP explicitly set to avoid [::] binding; recreate instance if changed
+portForwards:
+  - guestPort: 7777
+    guestIP: "127.0.0.1"
+    hostIP: "127.0.0.1"
+    hostPort: 7777
+    proto: "tcp"
+
+# Provision: install deps, create systemd unit for devup-agent
+# Agent binary is copied by host on first vm up; systemd starts it
+# Fallback: if systemd fails, run nohup ... > /var/log/devup-agent.log
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y ca-certificates curl python3
+      mkdir -p /etc/devup
+      cat > /etc/systemd/system/devup-agent.service << 'SVC'
+      [Unit]
+      Description=devup agent
+      After=network.target
+      [Service]
+      ExecStart=/usr/local/bin/devup-agent
+      Restart=on-failure
+      RestartSec=5
+      [Install]
+      WantedBy=multi-user.target
+      SVC
+      systemctl daemon-reload
+      systemctl enable devup-agent.service

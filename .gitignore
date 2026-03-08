@@ -1,0 +1,14 @@
+# Binaries (build artifacts - run `make` to rebuild)
+devup
+devup-agent
+devup-agent-*
+
+# macOS
+.DS_Store
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
