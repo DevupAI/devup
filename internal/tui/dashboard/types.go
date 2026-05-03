@@ -8,9 +8,10 @@ import (
 
 // View enum
 const (
-	ViewJobsList  = 0
-	ViewLogs      = 1
-	ViewStartModal = 2
+	ViewJobsList   = 0
+	ViewBenchmarks = 1
+	ViewLogs       = 2
+	ViewStartModal = 3
 )
 
 // Message types
@@ -30,6 +31,11 @@ type psResultMsg struct {
 type healthResultMsg struct {
 	ok      bool
 	latency time.Duration
+	err     error
+}
+
+type benchResultMsg struct {
+	summary *benchSummary
 	err     error
 }
 

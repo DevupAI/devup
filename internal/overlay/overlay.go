@@ -3,12 +3,11 @@ package overlay
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"devup/internal/logging"
+	"devup/internal/mountutil"
 )
 
 const DataDir = "/var/lib/devup/overlay"
@@ -47,11 +46,9 @@ func Mount(jobID, lowerdir, mergeddir string) (*State, error) {
 		}
 	}
 
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upper, work)
-	out, err := exec.Command("mount", "-t", "overlay", "overlay", "-o", opts, mergeddir).CombinedOutput()
-	if err != nil {
+	if err := mountutil.OverlayMount(mergeddir, lowerdir, upper, work); err != nil {
 		os.RemoveAll(base)
-		return nil, fmt.Errorf("mount overlay at %s: %w\n%s", mergeddir, err, out)
+		return nil, fmt.Errorf("mount overlay at %s: %w", mergeddir, err)
 	}
 
 	return &State{
@@ -69,7 +66,7 @@ func Unmount(s *State) error {
 		return nil
 	}
 	// 0x2 = MNT_DETACH: lazy unmount, safe even if fds are still open
-	if err := syscall.Unmount(s.MergedDir, 0x2); err != nil {
+	if err := mountutil.Unmount(s.MergedDir, 0x2); err != nil {
 		logging.Error("overlay unmount failed", "merged", s.MergedDir, "err", err)
 	}
 	if err := os.RemoveAll(s.Dir); err != nil {
@@ -122,7 +119,7 @@ func pruneOverlayMounts(overlayDir string) {
 		}
 		if containsOpt(fields[3], upperOpt) {
 			mountpoint := fields[1]
-			syscall.Unmount(mountpoint, 0x2)
+			_ = mountutil.Unmount(mountpoint, 0x2)
 			os.Remove(mountpoint)
 		}
 	}

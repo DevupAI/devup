@@ -32,6 +32,8 @@ func TestDetectCollectsWorkspaceRequirements(t *testing.T) {
 		"requirements.txt": "flask==3.0.0\n",
 		"Cargo.toml":       "[package]\nname = \"demo\"\n",
 		"Gemfile":          "source 'https://rubygems.org'\n",
+		"pom.xml":          "<project/>",
+		"composer.json":    `{"name":"demo/app"}`,
 	}
 	for name, contents := range files {
 		if err := os.WriteFile(filepath.Join(workdir, name), []byte(contents), 0644); err != nil {
@@ -50,6 +52,8 @@ func TestDetectCollectsWorkspaceRequirements(t *testing.T) {
 		{Tool: "python", Version: "latest", Source: "requirements.txt"},
 		{Tool: "rust", Version: "latest", Source: "Cargo.toml"},
 		{Tool: "ruby", Version: "latest", Source: "Gemfile"},
+		{Tool: "java", Version: "latest", Source: "pom.xml"},
+		{Tool: "php", Version: "latest", Source: "composer.json"},
 	}
 	if len(result.Reqs) != len(expected) {
 		t.Fatalf("expected %d requirements, got %d", len(expected), len(result.Reqs))
@@ -94,5 +98,33 @@ func TestGoVersionFromModFallbacks(t *testing.T) {
 
 	if got := goVersionFromMod(filepath.Join(workdir, "missing.mod")); got != "latest" {
 		t.Fatalf("expected missing file to return latest, got %q", got)
+	}
+}
+
+func TestFilterProvisionedRequirementsSkipsLatestSystemRuntimes(t *testing.T) {
+	reqs := []Requirement{
+		{Tool: "python", Version: "latest", Source: "requirements.txt"},
+		{Tool: "rust", Version: "latest", Source: "Cargo.toml"},
+		{Tool: "ruby", Version: "latest", Source: "Gemfile"},
+		{Tool: "java", Version: "latest", Source: "pom.xml"},
+		{Tool: "php", Version: "latest", Source: "composer.json"},
+		{Tool: "go", Version: "1.25.4", Source: "go.mod"},
+	}
+
+	filtered := filterProvisionedRequirements(reqs)
+	if len(filtered) == 0 {
+		t.Fatal("expected at least one requirement to remain")
+	}
+	foundGo := false
+	for _, req := range filtered {
+		if req.Tool == "go" {
+			foundGo = true
+		}
+		if shouldUseSystemTool(req) {
+			t.Fatalf("expected provisioned system tool to be filtered out, got %#v", req)
+		}
+	}
+	if !foundGo {
+		t.Fatalf("expected go requirement to remain, got %#v", filtered)
 	}
 }

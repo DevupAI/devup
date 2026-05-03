@@ -24,6 +24,7 @@ type Heartbeat struct {
 	Addr       string  `json:"addr"`
 	Port       int     `json:"port"`
 	SlotsFree  int     `json:"slots_free"`
+	ActiveJobs int     `json:"active_jobs"`
 	Version    string  `json:"version"`
 	MemTotalMB int     `json:"mem_total_mb,omitempty"`
 	MemFreeMB  int     `json:"mem_free_mb,omitempty"`
@@ -36,6 +37,7 @@ type Peer struct {
 	Addr       string
 	Port       int
 	SlotsFree  int
+	ActiveJobs int
 	Version    string
 	MemTotalMB int
 	MemFreeMB  int
@@ -46,6 +48,7 @@ type Peer struct {
 // NodeStats is the snapshot returned by the callback on every heartbeat tick.
 type NodeStats struct {
 	SlotsFree  int
+	ActiveJobs int
 	MemTotalMB int
 	MemFreeMB  int
 	LoadAvg1   float64
@@ -150,6 +153,7 @@ func (s *Service) broadcast(conn *net.UDPConn) {
 			Addr:       s.localAddr,
 			Port:       s.port,
 			SlotsFree:  stats.SlotsFree,
+			ActiveJobs: stats.ActiveJobs,
 			Version:    version.Version,
 			MemTotalMB: stats.MemTotalMB,
 			MemFreeMB:  stats.MemFreeMB,
@@ -218,6 +222,7 @@ func (s *Service) listen(conn *net.UDPConn) {
 			Addr:       hb.Addr,
 			Port:       hb.Port,
 			SlotsFree:  hb.SlotsFree,
+			ActiveJobs: hb.ActiveJobs,
 			Version:    hb.Version,
 			MemTotalMB: hb.MemTotalMB,
 			MemFreeMB:  hb.MemFreeMB,

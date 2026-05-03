@@ -12,3 +12,7 @@
 *.dll
 *.so
 *.dylib
+
+# Benchmarks
+.devup-bench/
+scripts/__pycache__/

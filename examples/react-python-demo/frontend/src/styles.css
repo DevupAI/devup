@@ -1,0 +1,96 @@
+:root {
+  color: #f3f0e8;
+  background:
+    radial-gradient(circle at top, rgba(219, 155, 84, 0.24), transparent 40%),
+    linear-gradient(180deg, #111111 0%, #1d1916 100%);
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 18px;
+}
+
+.card {
+  width: min(680px, 100%);
+  padding: 32px;
+  border-radius: 28px;
+  background: rgba(22, 18, 15, 0.84);
+  border: 1px solid rgba(243, 240, 232, 0.08);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.35);
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.78rem;
+  color: #d9a86c;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  line-height: 1.05;
+}
+
+.lede {
+  margin: 18px 0 0;
+  max-width: 52ch;
+  color: rgba(243, 240, 232, 0.78);
+  line-height: 1.6;
+}
+
+.status-row {
+  margin-top: 26px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.status-label {
+  color: rgba(243, 240, 232, 0.68);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 12px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
+.pill-ok {
+  background: rgba(66, 168, 120, 0.18);
+  color: #92f0bb;
+}
+
+.pill-error {
+  background: rgba(192, 70, 70, 0.18);
+  color: #ffb0b0;
+}
+
+.panel {
+  margin-top: 24px;
+  padding: 18px 20px;
+  border-radius: 18px;
+  background: rgba(243, 240, 232, 0.06);
+  line-height: 1.8;
+}
+
+.error {
+  margin-top: 10px;
+  color: #ffb0b0;
+}

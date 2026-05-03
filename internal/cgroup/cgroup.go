@@ -13,12 +13,23 @@ import (
 
 const CgroupRoot = "/sys/fs/cgroup/devup"
 
+var cgroupRoot = CgroupRoot
+
 // Limits describes resource constraints for a single job.
 type Limits struct {
-	MemoryMaxBytes int64 // memory.max; 0 = unlimited
-	CPUQuotaUs     int   // cpu.max quota in microseconds; 0 = unlimited
-	CPUPeriodUs    int   // cpu.max period in microseconds; default 100000
-	PidsMax        int   // pids.max; 0 = unlimited
+	MemoryMaxBytes  int64 // memory.max; 0 = unlimited
+	MemoryHighBytes int64 // memory.high; 0 = unlimited
+	MemoryLowBytes  int64 // memory.low; 0 = no protection
+	CPUQuotaUs      int   // cpu.max quota in microseconds; 0 = unlimited
+	CPUPeriodUs     int   // cpu.max period in microseconds; default 100000
+	PidsMax         int   // pids.max; 0 = unlimited
+}
+
+// MemoryEvents reports selected cgroup memory.events counters.
+type MemoryEvents struct {
+	High    uint64
+	OOM     uint64
+	OOMKill uint64
 }
 
 // Available reports whether cgroups v2 unified hierarchy is usable.
@@ -33,9 +44,9 @@ func Init() error {
 		return fmt.Errorf("cgroups v2 not available: %w", err)
 	}
 
-	if err := os.MkdirAll(CgroupRoot, 0755); err != nil {
+	if err := os.MkdirAll(cgroupRoot, 0755); err != nil {
 		Available = false
-		return fmt.Errorf("mkdir %s: %w", CgroupRoot, err)
+		return fmt.Errorf("mkdir %s: %w", cgroupRoot, err)
 	}
 
 	// Enable memory, cpu, pids controllers on the parent so children inherit them
@@ -43,7 +54,7 @@ func Init() error {
 	if err := os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control", []byte(controllers), 0644); err != nil {
 		logging.Error("enable root controllers (may already be set)", "err", err)
 	}
-	if err := os.WriteFile(filepath.Join(CgroupRoot, "cgroup.subtree_control"), []byte(controllers), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "cgroup.subtree_control"), []byte(controllers), 0644); err != nil {
 		logging.Error("enable devup controllers", "err", err)
 	}
 
@@ -56,15 +67,19 @@ func Create(jobID string, l Limits) error {
 	if !Available {
 		return fmt.Errorf("cgroups not available")
 	}
-	dir := filepath.Join(CgroupRoot, jobID)
+	dir := filepath.Join(cgroupRoot, jobID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir cgroup %s: %w", dir, err)
 	}
 
-	if l.MemoryMaxBytes > 0 {
-		if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte(strconv.FormatInt(l.MemoryMaxBytes, 10)), 0644); err != nil {
-			return fmt.Errorf("write memory.max: %w", err)
-		}
+	if err := writeMemoryValue(filepath.Join(dir, "memory.max"), l.MemoryMaxBytes, true); err != nil {
+		return fmt.Errorf("write memory.max: %w", err)
+	}
+	if err := writeMemoryValue(filepath.Join(dir, "memory.high"), l.MemoryHighBytes, true); err != nil {
+		return fmt.Errorf("write memory.high: %w", err)
+	}
+	if err := writeMemoryValue(filepath.Join(dir, "memory.low"), l.MemoryLowBytes, false); err != nil {
+		return fmt.Errorf("write memory.low: %w", err)
 	}
 
 	if l.CPUQuotaUs > 0 {
@@ -92,8 +107,80 @@ func AddProcess(jobID string, pid int) error {
 	if !Available {
 		return fmt.Errorf("cgroups not available")
 	}
-	path := filepath.Join(CgroupRoot, jobID, "cgroup.procs")
+	path := filepath.Join(cgroupRoot, jobID, "cgroup.procs")
 	return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644)
+}
+
+// SetMemoryLimit updates a job's hard memory limit in memory.max.
+func SetMemoryLimit(jobID string, bytes int64) error {
+	if !Available {
+		return fmt.Errorf("cgroups not available")
+	}
+	return writeMemoryValue(filepath.Join(cgroupRoot, jobID, "memory.max"), bytes, true)
+}
+
+// SetMemoryHigh updates a job's soft pressure limit in memory.high.
+func SetMemoryHigh(jobID string, bytes int64) error {
+	if !Available {
+		return fmt.Errorf("cgroups not available")
+	}
+	return writeMemoryValue(filepath.Join(cgroupRoot, jobID, "memory.high"), bytes, true)
+}
+
+// SetMemoryLow updates a job's protected floor in memory.low.
+func SetMemoryLow(jobID string, bytes int64) error {
+	if !Available {
+		return fmt.Errorf("cgroups not available")
+	}
+	return writeMemoryValue(filepath.Join(cgroupRoot, jobID, "memory.low"), bytes, false)
+}
+
+// ReadMemoryCurrent returns a job's current cgroup memory usage in bytes.
+func ReadMemoryCurrent(jobID string) (int64, error) {
+	if !Available {
+		return 0, fmt.Errorf("cgroups not available")
+	}
+	return readIntValue(filepath.Join(cgroupRoot, jobID, "memory.current"))
+}
+
+// ReadMemoryPeak returns the cgroup's memory.peak value in bytes.
+func ReadMemoryPeak(jobID string) (int64, error) {
+	if !Available {
+		return 0, fmt.Errorf("cgroups not available")
+	}
+	return readIntValue(filepath.Join(cgroupRoot, jobID, "memory.peak"))
+}
+
+// ReadMemoryEvents returns selected memory.events counters.
+func ReadMemoryEvents(jobID string) (MemoryEvents, error) {
+	if !Available {
+		return MemoryEvents{}, fmt.Errorf("cgroups not available")
+	}
+	data, err := os.ReadFile(filepath.Join(cgroupRoot, jobID, "memory.events"))
+	if err != nil {
+		return MemoryEvents{}, err
+	}
+
+	var events MemoryEvents
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		value, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "high":
+			events.High = value
+		case "oom":
+			events.OOM = value
+		case "oom_kill":
+			events.OOMKill = value
+		}
+	}
+	return events, nil
 }
 
 // Destroy removes a job's cgroup directory. The kernel requires all
@@ -102,7 +189,7 @@ func Destroy(jobID string) error {
 	if !Available {
 		return nil
 	}
-	dir := filepath.Join(CgroupRoot, jobID)
+	dir := filepath.Join(cgroupRoot, jobID)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return nil
 	}
@@ -123,7 +210,7 @@ func Reconcile(activeJobIDs map[string]bool) {
 	if !Available {
 		return
 	}
-	entries, err := os.ReadDir(CgroupRoot)
+	entries, err := os.ReadDir(cgroupRoot)
 	if err != nil {
 		return
 	}
@@ -152,4 +239,23 @@ func killProcsInCgroup(dir string) {
 			syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
+}
+
+func writeMemoryValue(path string, bytes int64, unlimited bool) error {
+	value := "0"
+	switch {
+	case bytes > 0:
+		value = strconv.FormatInt(bytes, 10)
+	case unlimited:
+		value = "max"
+	}
+	return os.WriteFile(path, []byte(value), 0644)
+}
+
+func readIntValue(path string) (int64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
 }

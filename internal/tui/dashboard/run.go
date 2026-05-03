@@ -13,7 +13,7 @@ import (
 
 // RunDashboard runs the TUI dashboard. Returns error only for setup failures.
 // The dashboard runs until user quits.
-func RunDashboard(noVMUp bool, refreshMs int, verbose bool) error {
+func RunDashboard(noVMUp bool, benchPath string, refreshMs int, verbose bool) error {
 	if !vm.IsDarwin() {
 		fmt.Println("Dashboard is macOS+Lima only (for now).")
 		os.Exit(0)
@@ -40,7 +40,7 @@ func RunDashboard(noVMUp bool, refreshMs int, verbose bool) error {
 		refreshMs = 2000
 	}
 
-	m := NewModel(cfg, configPath, refreshMs, verbose)
+	m := NewModel(cfg, configPath, benchPath, refreshMs, verbose)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	m.SetProgram(p)
 
@@ -49,4 +49,3 @@ func RunDashboard(noVMUp bool, refreshMs int, verbose bool) error {
 	}
 	return nil
 }
-

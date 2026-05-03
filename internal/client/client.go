@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	BaseURL       = "http://127.0.0.1:7777"
+	BaseURL        = "http://127.0.0.1:7777"
 	ConnectTimeout = 5 * time.Second
 	ExitCodePrefix = "DEVUP_EXIT_CODE="
 )
@@ -100,9 +100,14 @@ func (c *Client) Run(ctx context.Context, req *api.RunRequest, out io.Writer) (i
 	}
 	c.setHeaders(httpReq)
 	httpReq.Header.Set("Content-Type", "application/json")
-	// No total timeout for streaming
-	streamClient := &http.Client{Transport: c.http.Transport}
-	streamClient.Timeout = 0
+	// Toolchain hydration and shadow workspace prep can delay first bytes.
+	// Disable client-side header and body deadlines; the caller's context is the bound.
+	transport := c.http.Transport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 0
+	streamClient := &http.Client{
+		Transport: transport,
+		Timeout:   0,
+	}
 	resp, err := streamClient.Do(httpReq)
 	if err != nil {
 		return -1, err
@@ -151,7 +156,13 @@ func (c *Client) Start(ctx context.Context, req *api.StartRequest) (string, erro
 	}
 	c.setHeaders(httpReq)
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(httpReq)
+	transport := c.http.Transport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 0
+	startClient := &http.Client{
+		Transport: transport,
+		Timeout:   0,
+	}
+	resp, err := startClient.Do(httpReq)
 	if err != nil {
 		return "", err
 	}
@@ -160,16 +171,25 @@ func (c *Client) Start(ctx context.Context, req *api.StartRequest) (string, erro
 		return "", fmt.Errorf("agent rejected token (401); run 'devup vm reset-token' and restart VM")
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", fmt.Errorf("too many concurrent jobs")
+		return "", httpErrorWithBody("start", resp)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("start: %s", resp.Status)
+		return "", httpErrorWithBody("start", resp)
 	}
 	var sr api.StartResponse
 	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
 		return "", err
 	}
 	return sr.JobID, nil
+}
+
+func httpErrorWithBody(prefix string, resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		return fmt.Errorf("%s: %s", prefix, resp.Status)
+	}
+	return fmt.Errorf("%s: %s: %s", prefix, resp.Status, msg)
 }
 
 // Ps lists all jobs
@@ -216,7 +236,7 @@ func (c *Client) Logs(ctx context.Context, jobID string, follow bool, out io.Wri
 		transport.ResponseHeaderTimeout = 0
 		httpClient = &http.Client{
 			Transport: transport,
-			Timeout:  0,
+			Timeout:   0,
 		}
 	}
 	resp, err := httpClient.Do(req)

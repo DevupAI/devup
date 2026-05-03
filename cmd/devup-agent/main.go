@@ -26,9 +26,11 @@ import (
 	"devup/internal/cgroup"
 	"devup/internal/discovery"
 	"devup/internal/logging"
+	"devup/internal/mountutil"
 	"devup/internal/netns"
 	"devup/internal/overlay"
 	"devup/internal/ringbuffer"
+	"devup/internal/shadow"
 	"devup/internal/sysinfo"
 	"devup/internal/toolchain"
 	"devup/internal/version"
@@ -42,7 +44,7 @@ const (
 	jsonRequestMaxBytes = 1 * 1024 * 1024
 
 	// Job constants
-	maxConcurrentJobs = 8
+	maxConcurrentJobs = 32
 	jobRetentionTTL   = 10 * time.Minute
 	ringBufferSize    = 64 * 1024
 	stopGracePeriod   = 2 * time.Second
@@ -57,6 +59,7 @@ const (
 	workspacesDir   = "/var/lib/devup/workspaces"
 	workspaceMaxAge = 1 * time.Hour
 	uploadMaxBytes  = 500 * 1024 * 1024 // 500 MB
+	mib             = int64(1024 * 1024)
 )
 
 type runResult struct {
@@ -66,22 +69,27 @@ type runResult struct {
 }
 
 type job struct {
-	mu          sync.RWMutex
-	info        api.JobInfo
-	cmd         *exec.Cmd
-	logBuf      *ringbuffer.RingBuffer
-	broadcast   chan []byte
-	mounted     []string // bind mount paths (non-overlay)
-	overlays    []*overlay.State
-	nsName      string // network namespace name (empty = no isolation)
-	done        chan struct{}
-	semAcquired bool
+	mu                   sync.RWMutex
+	info                 api.JobInfo
+	cmd                  *exec.Cmd
+	logBuf               *ringbuffer.RingBuffer
+	broadcast            chan []byte
+	mounted              []string // bind mount paths (non-overlay)
+	overlays             []*overlay.State
+	overlayDirs          []string
+	nsName               string // network namespace name (empty = no isolation)
+	mountNamespaceSpec   string
+	privateMounts        bool
+	done                 chan struct{}
+	memoryControllerDone chan struct{}
+	semAcquired          bool
 }
 
 var (
-	jobs   = make(map[string]*job)
-	jobsMu sync.RWMutex
-	jobSem = make(chan struct{}, maxConcurrentJobs)
+	jobs        = make(map[string]*job)
+	jobsMu      sync.RWMutex
+	jobSem      = make(chan struct{}, maxConcurrentJobs)
+	admissionMu sync.Mutex
 
 	// inflightMounts tracks mount paths that are between applyMounts and job
 	// registration. The reconciler skips these to avoid a race where mounts
@@ -91,6 +99,14 @@ var (
 )
 
 func main() {
+	if handled, err := maybeRunMountNamespaceExec(os.Args[1:]); handled {
+		if err != nil {
+			logging.Error("mount namespace exec failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	token, err := os.ReadFile("/etc/devup/token")
 	if err != nil {
 		logging.Error("cannot read token", "err", err)
@@ -139,8 +155,11 @@ func main() {
 	}
 	disco := discovery.New(hostname, 7777, func() discovery.NodeStats {
 		stats := sysinfo.Read()
+		active := activeJobCount()
+		slotsFree := availableSlots(stats, active)
 		return discovery.NodeStats{
-			SlotsFree:  maxConcurrentJobs - len(activeJobIDs()),
+			SlotsFree:  slotsFree,
+			ActiveJobs: active,
 			MemTotalMB: stats.MemTotalMB,
 			MemFreeMB:  stats.MemFreeMB,
 			LoadAvg1:   stats.LoadAvg1,
@@ -154,6 +173,9 @@ func main() {
 
 	if err := overlay.Init(); err != nil {
 		logging.Error("overlay init failed", "err", err)
+	}
+	if err := shadow.Init(); err != nil {
+		logging.Error("shadow init failed", "err", err)
 	}
 
 	if err := cgroup.Init(); err != nil {
@@ -319,8 +341,9 @@ func handleCluster(disco *discovery.Service) http.HandlerFunc {
 			return
 		}
 		peers := disco.Peers()
-		activeCount := len(activeJobIDs())
+		activeCount := activeJobCount()
 		localStats := sysinfo.Read()
+		localSlotsFree := availableSlots(localStats, activeCount)
 
 		var infos []api.PeerInfo
 		localID := disco.NodeID()
@@ -340,7 +363,7 @@ func handleCluster(disco *discovery.Service) http.HandlerFunc {
 				Version:    p.Version,
 				Status:     status,
 				LastSeen:   p.LastSeen.Unix(),
-				ActiveJobs: maxConcurrentJobs - p.SlotsFree,
+				ActiveJobs: p.ActiveJobs,
 				MemTotalMB: p.MemTotalMB,
 				MemFreeMB:  p.MemFreeMB,
 				LoadAvg1:   p.LoadAvg1,
@@ -351,7 +374,7 @@ func handleCluster(disco *discovery.Service) http.HandlerFunc {
 				NodeID:     localID,
 				Addr:       "127.0.0.1",
 				Port:       7777,
-				SlotsFree:  maxConcurrentJobs - activeCount,
+				SlotsFree:  localSlotsFree,
 				Version:    version.Version,
 				Status:     "local",
 				LastSeen:   time.Now().Unix(),
@@ -377,6 +400,7 @@ func handleRun(sem chan struct{}, results map[string]*runResult, resultsMu *sync
 		if !decodeJSONBody(w, r, &req) {
 			return
 		}
+		profile := normalizedProfile(req.Profile, api.ProfileBatch)
 		if len(req.Cmd) == 0 {
 			http.Error(w, "cmd required", http.StatusBadRequest)
 			return
@@ -400,34 +424,48 @@ func handleRun(sem chan struct{}, results map[string]*runResult, resultsMu *sync
 			return
 		}
 
+		execMounts, mountErr := prepareExecutionMounts(req.Mounts, req.Shadow)
+		if mountErr != nil {
+			http.Error(w, "shadow: "+mountErr.Error(), http.StatusBadRequest)
+			return
+		}
+		execWorkdir := resolveExecutionWorkdir(execMounts, req.Cwd)
+
+		useOverlay := req.Overlay || req.Shadow
+		runID := "run-" + req.RequestID
+		usePrivateMounts := privateMountNamespacesAvailable() && len(execMounts) > 0
 		// Apply workspace mounts (overlay or bind)
 		var mountedPaths []string
 		var runOverlays []*overlay.State
-		if req.Overlay {
-			var mergedPaths []string
-			var mountErr error
-			runOverlays, mergedPaths, mountErr = applyOverlayMounts("run-"+req.RequestID, req.Mounts)
-			if mountErr != nil {
-				http.Error(w, "overlay: "+mountErr.Error(), http.StatusBadRequest)
-				return
+		var mountSpecPath string
+		runOverlayDirs := overlayStateDirs(runID, execMounts, useOverlay)
+		if !usePrivateMounts {
+			if useOverlay {
+				var mergedPaths []string
+				runOverlays, mergedPaths, mountErr = applyOverlayMounts(runID, execMounts)
+				if mountErr != nil {
+					http.Error(w, "overlay: "+mountErr.Error(), http.StatusBadRequest)
+					return
+				}
+				mountedPaths = mergedPaths
+			} else {
+				mountedPaths, mountErr = applyMounts(execMounts)
+				if mountErr != nil {
+					http.Error(w, "mount: "+mountErr.Error(), http.StatusBadRequest)
+					return
+				}
 			}
-			mountedPaths = mergedPaths
+			markInflight(mountedPaths)
+			defer clearInflight(mountedPaths)
+			defer func() {
+				cleanupOverlays(runOverlays)
+				if !useOverlay {
+					cleanupMounts(mountedPaths)
+				}
+			}()
 		} else {
-			var mountErr error
-			mountedPaths, mountErr = applyMounts(req.Mounts)
-			if mountErr != nil {
-				http.Error(w, "mount: "+mountErr.Error(), http.StatusBadRequest)
-				return
-			}
+			defer cleanupMountNamespaceArtifacts(mountSpecPath, runOverlayDirs)
 		}
-		markInflight(mountedPaths)
-		defer clearInflight(mountedPaths)
-		defer func() {
-			cleanupOverlays(runOverlays)
-			if !req.Overlay {
-				cleanupMounts(mountedPaths)
-			}
-		}()
 
 		if err := ensureDefaultDirs(); err != nil {
 			http.Error(w, "ensure dirs: "+err.Error(), http.StatusInternalServerError)
@@ -435,7 +473,7 @@ func handleRun(sem chan struct{}, results map[string]*runResult, resultsMu *sync
 		}
 
 		// JIT toolchain provisioning (non-fatal)
-		miseEnv, miseErr := toolchain.EnsureForWorkdir(req.Cwd)
+		miseEnv, miseErr := toolchain.EnsureForWorkdir(execWorkdir)
 		if miseErr != nil {
 			logging.Error("toolchain provision", "err", miseErr)
 		}
@@ -456,11 +494,27 @@ func handleRun(sem chan struct{}, results map[string]*runResult, resultsMu *sync
 		runCtx, cancel := context.WithTimeout(r.Context(), maxRunTime)
 		defer cancel()
 
-		cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Env = mergeMiseEnv(buildEnv(req.Env), miseEnv)
-		if req.Cwd != "" {
-			cmd.Dir = req.Cwd
+		cmdEnv := mergeMiseEnv(buildEnv(req.Env), miseEnv)
+		var cmd *exec.Cmd
+		if usePrivateMounts {
+			cmd, mountSpecPath, mountErr = buildMountNamespaceCommand(mountNamespaceExecSpec{
+				JobID:   runID,
+				Cmd:     cmdArgs,
+				Cwd:     req.Cwd,
+				Mounts:  execMounts,
+				Overlay: useOverlay,
+			}, cmdEnv)
+			if mountErr != nil {
+				http.Error(w, "mount namespace: "+mountErr.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			cmd.Env = cmdEnv
+			if req.Cwd != "" {
+				cmd.Dir = req.Cwd
+			}
 		}
 		var buf bytes.Buffer
 		cmd.Stdout = &buf
@@ -469,26 +523,17 @@ func handleRun(sem chan struct{}, results map[string]*runResult, resultsMu *sync
 		runCgroupID := ""
 		start := time.Now()
 		if err := cmd.Start(); err != nil {
+			if usePrivateMounts {
+				cleanupMountNamespaceArtifacts(mountSpecPath, runOverlayDirs)
+			}
 			http.Error(w, "exec: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if req.Limits != nil && cgroup.Available {
-			runCgroupID = "run-" + req.RequestID
-			cgLimits := cgroup.Limits{
-				MemoryMaxBytes: int64(req.Limits.MemoryMB) * 1024 * 1024,
-				CPUQuotaUs:     req.Limits.CPUPercent * 1000,
-				CPUPeriodUs:    100000,
-				PidsMax:        req.Limits.PidsMax,
-			}
-			if err := cgroup.Create(runCgroupID, cgLimits); err != nil {
+		if cgroup.Available {
+			runCgroupID = runID
+			if _, err := applyJobCgroup(runCgroupID, profile, req.Limits, cmd.Process.Pid, sysinfo.Read()); err != nil {
 				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				http.Error(w, "cgroup create: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if err := cgroup.AddProcess(runCgroupID, cmd.Process.Pid); err != nil {
-				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				cgroup.Destroy(runCgroupID)
-				http.Error(w, "cgroup add: "+err.Error(), http.StatusInternalServerError)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 		}
@@ -539,6 +584,7 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
+	profile := normalizedProfile(req.Profile, api.ProfileService)
 	if len(req.Cmd) == 0 {
 		http.Error(w, "cmd required", http.StatusBadRequest)
 		return
@@ -552,153 +598,60 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many concurrent jobs", http.StatusTooManyRequests)
 		return
 	}
-
 	jobID := generateJobID()
+	hostStats := sysinfo.Read()
+	if err := reserveStartAdmission(jobID, profile, req.Limits, hostStats); err != nil {
+		<-jobSem
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+	releaseAdmission := true
+	defer func() {
+		if releaseAdmission {
+			releaseStartAdmission(jobID)
+		}
+	}()
+
+	execMounts, mountErr := prepareExecutionMounts(req.Mounts, req.Shadow)
+	if mountErr != nil {
+		<-jobSem
+		http.Error(w, "shadow: "+mountErr.Error(), http.StatusBadRequest)
+		return
+	}
+	execWorkdir := resolveExecutionWorkdir(execMounts, req.Cwd)
+	useOverlay := req.Overlay || req.Shadow
+	usePrivateMounts := privateMountNamespacesAvailable() && len(execMounts) > 0
 
 	// Apply mounts (overlay or bind) -- mark as inflight so the reconciler
 	// doesn't prune them before the job is registered.
 	var mountedPaths []string
 	var jobOverlays []*overlay.State
-	if req.Overlay {
-		var mergedPaths []string
-		var mountErr error
-		jobOverlays, mergedPaths, mountErr = applyOverlayMounts(jobID, req.Mounts)
-		if mountErr != nil {
-			<-jobSem
-			http.Error(w, "overlay: "+mountErr.Error(), http.StatusBadRequest)
-			return
+	jobOverlayDirs := overlayStateDirs(jobID, execMounts, useOverlay)
+	var mountSpecPath string
+	if !usePrivateMounts {
+		if useOverlay {
+			var mergedPaths []string
+			jobOverlays, mergedPaths, mountErr = applyOverlayMounts(jobID, execMounts)
+			if mountErr != nil {
+				<-jobSem
+				http.Error(w, "overlay: "+mountErr.Error(), http.StatusBadRequest)
+				return
+			}
+			mountedPaths = mergedPaths
+		} else {
+			mountedPaths, mountErr = applyMounts(execMounts)
+			if mountErr != nil {
+				<-jobSem
+				http.Error(w, "mount: "+mountErr.Error(), http.StatusBadRequest)
+				return
+			}
 		}
-		mountedPaths = mergedPaths
 		markInflight(mountedPaths)
 		defer clearInflight(mountedPaths)
-
-		if err := ensureDefaultDirs(); err != nil {
-			cleanupOverlays(jobOverlays)
-			<-jobSem
-			http.Error(w, "ensure dirs: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		miseEnv, miseErr := toolchain.EnsureForWorkdir(req.Cwd)
-		if miseErr != nil {
-			logging.Error("toolchain provision", "err", miseErr)
-		}
-
-		// Network namespace
-		var jobNsName string
-		cmdArgs := req.Cmd
-		if req.NetIsolate {
-			jobNsName = "devup-" + jobID
-			if err := netns.Create(jobNsName); err != nil {
-				cleanupOverlays(jobOverlays)
-				<-jobSem
-				http.Error(w, "netns: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			cmdArgs = append([]string{"ip", "netns", "exec", jobNsName}, cmdArgs...)
-		}
-
-		now := time.Now().Unix()
-		j := &job{
-			info: api.JobInfo{
-				JobID:     jobID,
-				Cmd:       req.Cmd,
-				Status:    "running",
-				StartedAt: now,
-				Limits:    req.Limits,
-			},
-			logBuf:      ringbuffer.New(ringBufferSize),
-			broadcast:   make(chan []byte, broadcastChanSize),
-			overlays:    jobOverlays,
-			nsName:      jobNsName,
-			done:        make(chan struct{}),
-			semAcquired: true,
-		}
-
-		cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Env = mergeMiseEnv(buildEnv(req.Env), miseEnv)
-		if req.Cwd != "" {
-			cmd.Dir = req.Cwd
-		}
-
-		stdoutPipe, stderrPipe, err := commandOutputPipes(cmd)
-		if err != nil {
-			if jobNsName != "" {
-				netns.Destroy(jobNsName)
-			}
-			cleanupOverlays(jobOverlays)
-			<-jobSem
-			http.Error(w, "exec: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if err := cmd.Start(); err != nil {
-			if jobNsName != "" {
-				netns.Destroy(jobNsName)
-			}
-			cleanupOverlays(jobOverlays)
-			<-jobSem
-			http.Error(w, "exec: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		j.cmd = cmd
-
-		if req.Limits != nil && cgroup.Available {
-			cgLimits := cgroup.Limits{
-				MemoryMaxBytes: int64(req.Limits.MemoryMB) * 1024 * 1024,
-				CPUQuotaUs:     req.Limits.CPUPercent * 1000,
-				CPUPeriodUs:    100000,
-				PidsMax:        req.Limits.PidsMax,
-			}
-			if err := cgroup.Create(jobID, cgLimits); err != nil {
-				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				if jobNsName != "" {
-					netns.Destroy(jobNsName)
-				}
-				cleanupOverlays(jobOverlays)
-				<-jobSem
-				http.Error(w, "cgroup create: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if err := cgroup.AddProcess(jobID, cmd.Process.Pid); err != nil {
-				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				cgroup.Destroy(jobID)
-				if jobNsName != "" {
-					netns.Destroy(jobNsName)
-				}
-				cleanupOverlays(jobOverlays)
-				<-jobSem
-				http.Error(w, "cgroup add: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		jobsMu.Lock()
-		jobs[jobID] = j
-		jobsMu.Unlock()
-
-		go copyToBufferAndBroadcast(stdoutPipe, j.logBuf, j.broadcast)
-		go copyToBufferAndBroadcast(stderrPipe, j.logBuf, j.broadcast)
-
-		go startJobWaiter(j, jobID)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(api.StartResponse{JobID: jobID})
-		return
 	}
-
-	// Non-overlay path (legacy bind mounts)
-	mountedPaths, mountErr := applyMounts(req.Mounts)
-	if mountErr != nil {
-		<-jobSem
-		http.Error(w, "mount: "+mountErr.Error(), http.StatusBadRequest)
-		return
-	}
-	markInflight(mountedPaths)
-	defer clearInflight(mountedPaths)
 
 	if err := ensureDefaultDirs(); err != nil {
+		cleanupOverlays(jobOverlays)
 		cleanupMounts(mountedPaths)
 		<-jobSem
 		http.Error(w, "ensure dirs: "+err.Error(), http.StatusInternalServerError)
@@ -706,7 +659,7 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// JIT toolchain provisioning (non-fatal)
-	miseEnv, miseErr := toolchain.EnsureForWorkdir(req.Cwd)
+	miseEnv, miseErr := toolchain.EnsureForWorkdir(execWorkdir)
 	if miseErr != nil {
 		logging.Error("toolchain provision", "err", miseErr)
 	}
@@ -717,6 +670,7 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 	if req.NetIsolate {
 		jobNsName = "devup-" + jobID
 		if err := netns.Create(jobNsName); err != nil {
+			cleanupOverlays(jobOverlays)
 			cleanupMounts(mountedPaths)
 			<-jobSem
 			http.Error(w, "netns: "+err.Error(), http.StatusInternalServerError)
@@ -729,23 +683,54 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 		info: api.JobInfo{
 			JobID:     jobID,
 			Cmd:       req.Cmd,
+			Profile:   profile,
 			Status:    "running",
 			StartedAt: now,
 			Limits:    req.Limits,
 		},
-		logBuf:      ringbuffer.New(ringBufferSize),
-		broadcast:   make(chan []byte, broadcastChanSize),
-		mounted:     mountedPaths,
-		nsName:      jobNsName,
-		done:        make(chan struct{}),
-		semAcquired: true,
+		logBuf:             ringbuffer.New(ringBufferSize),
+		broadcast:          make(chan []byte, broadcastChanSize),
+		mounted:            mountedPaths,
+		overlays:           jobOverlays,
+		overlayDirs:        jobOverlayDirs,
+		nsName:             jobNsName,
+		privateMounts:      usePrivateMounts,
+		mountNamespaceSpec: mountSpecPath,
+		done:               make(chan struct{}),
+		semAcquired:        true,
 	}
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = mergeMiseEnv(buildEnv(req.Env), miseEnv)
-	if req.Cwd != "" {
-		cmd.Dir = req.Cwd
+	cmdEnv := mergeMiseEnv(buildEnv(req.Env), miseEnv)
+	var cmd *exec.Cmd
+	if usePrivateMounts {
+		cmd, mountSpecPath, mountErr = buildMountNamespaceCommand(mountNamespaceExecSpec{
+			JobID:   jobID,
+			Cmd:     cmdArgs,
+			Cwd:     req.Cwd,
+			Mounts:  execMounts,
+			Overlay: useOverlay,
+		}, cmdEnv)
+		if mountErr != nil {
+			if jobNsName != "" {
+				netns.Destroy(jobNsName)
+			}
+			cleanupOverlays(jobOverlays)
+			cleanupMounts(mountedPaths)
+			<-jobSem
+			http.Error(w, "mount namespace: "+mountErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		j.mountNamespaceSpec = mountSpecPath
+	} else {
+		cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = cmdEnv
+		if req.Cwd != "" {
+			cmd.Dir = req.Cwd
+		}
+	}
+	if usePrivateMounts {
+		cmd.Env = cmdEnv
 	}
 
 	stdoutPipe, stderrPipe, err := commandOutputPipes(cmd)
@@ -753,7 +738,9 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 		if jobNsName != "" {
 			netns.Destroy(jobNsName)
 		}
+		cleanupOverlays(jobOverlays)
 		cleanupMounts(mountedPaths)
+		cleanupMountNamespaceArtifacts(mountSpecPath, jobOverlayDirs)
 		<-jobSem
 		http.Error(w, "exec: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -763,46 +750,45 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 		if jobNsName != "" {
 			netns.Destroy(jobNsName)
 		}
+		cleanupOverlays(jobOverlays)
 		cleanupMounts(mountedPaths)
+		cleanupMountNamespaceArtifacts(mountSpecPath, jobOverlayDirs)
 		<-jobSem
 		http.Error(w, "exec: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	j.cmd = cmd
 
-	if req.Limits != nil && cgroup.Available {
-		cgLimits := cgroup.Limits{
-			MemoryMaxBytes: int64(req.Limits.MemoryMB) * 1024 * 1024,
-			CPUQuotaUs:     req.Limits.CPUPercent * 1000,
-			CPUPeriodUs:    100000,
-			PidsMax:        req.Limits.PidsMax,
-		}
-		if err := cgroup.Create(jobID, cgLimits); err != nil {
+	if cgroup.Available {
+		memoryStatus, err := applyJobCgroup(jobID, profile, req.Limits, cmd.Process.Pid, hostStats)
+		if err != nil {
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			if jobNsName != "" {
 				netns.Destroy(jobNsName)
 			}
+			cleanupOverlays(jobOverlays)
 			cleanupMounts(mountedPaths)
+			cleanupMountNamespaceArtifacts(mountSpecPath, jobOverlayDirs)
 			<-jobSem
-			http.Error(w, "cgroup create: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if err := cgroup.AddProcess(jobID, cmd.Process.Pid); err != nil {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			cgroup.Destroy(jobID)
-			if jobNsName != "" {
-				netns.Destroy(jobNsName)
-			}
-			cleanupMounts(mountedPaths)
-			<-jobSem
-			http.Error(w, "cgroup add: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+		j.info.Memory = memoryStatus
 	}
 
 	jobsMu.Lock()
 	jobs[jobID] = j
 	jobsMu.Unlock()
+	releaseStartAdmission(jobID)
+	releaseAdmission = false
+
+	if cgroup.Available {
+		hardMaxBytes := int64(0)
+		if req.Limits != nil {
+			hardMaxBytes = int64(req.Limits.MemoryMB) * mib
+		}
+		startAdaptiveMemoryController(j, jobID, profile, hardMaxBytes)
+	}
 
 	// Start goroutines to copy stdout/stderr to ring buffer and broadcast
 	go copyToBufferAndBroadcast(stdoutPipe, j.logBuf, j.broadcast)
@@ -841,9 +827,16 @@ func startJobWaiter(j *job, jobID string) {
 	j.info.FinishedAt = now
 	j.mu.Unlock()
 	close(j.done)
+	if j.memoryControllerDone != nil {
+		waitForDone(j.memoryControllerDone, 1*time.Second)
+	}
 	cgroup.Destroy(jobID)
-	cleanupOverlays(j.overlays)
-	cleanupMounts(j.mounted)
+	if j.privateMounts {
+		cleanupMountNamespaceArtifacts(j.mountNamespaceSpec, j.overlayDirs)
+	} else {
+		cleanupOverlays(j.overlays)
+		cleanupMounts(j.mounted)
+	}
 	if j.nsName != "" {
 		netns.Destroy(j.nsName)
 	}
@@ -917,8 +910,10 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(200)
 		flusher.Flush()
+		sent := 0
 		if len(buf) > 0 {
 			w.Write(buf)
+			sent = len(buf)
 			flusher.Flush()
 		}
 		// Stream new output with optional keepalive
@@ -928,11 +923,16 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 			select {
 			case chunk, ok := <-j.broadcast:
 				if !ok {
+					flushFollowTail(w, j, &sent)
+					flusher.Flush()
 					return
 				}
 				w.Write(chunk)
+				sent += len(chunk)
 				flusher.Flush()
 			case <-j.done:
+				flushFollowTail(w, j, &sent)
+				flusher.Flush()
 				return
 			case <-r.Context().Done():
 				return
@@ -945,6 +945,25 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	if len(buf) > 0 {
 		w.Write(buf)
 	}
+}
+
+func flushFollowTail(w io.Writer, j *job, sent *int) {
+	if w == nil || j == nil || sent == nil {
+		return
+	}
+
+	j.mu.RLock()
+	buf := j.logBuf.Bytes()
+	j.mu.RUnlock()
+
+	if len(buf) < *sent {
+		*sent = 0
+	}
+	if len(buf) <= *sent {
+		return
+	}
+	w.Write(buf[*sent:])
+	*sent = len(buf)
 }
 
 func handleStop(w http.ResponseWriter, r *http.Request) {
@@ -1042,6 +1061,12 @@ func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 		{"python3", "python3 -V"},
 		{"pip", "pip -V"},
 		{"go", "go version"},
+		{"ruby", "ruby -v"},
+		{"java", "java -version"},
+		{"cargo", "cargo -V"},
+		{"rustc", "rustc -V"},
+		{"php", "php -v"},
+		{"composer", "COMPOSER_ALLOW_SUPERUSER=1 composer --version"},
 		{"gcc", "gcc --version"},
 		{"g++", "g++ --version"},
 		{"make", "make --version"},
@@ -1051,8 +1076,8 @@ func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := api.SystemInfoResponse{Tools: make(map[string]api.ToolInfo, len(tools))}
 	for _, t := range tools {
-		out, err := exec.Command("bash", "-lc", t.Cmd+" 2>/dev/null | head -1").CombinedOutput()
-		version := strings.TrimSpace(string(out))
+		out, err := exec.Command("bash", "-lc", t.Cmd).CombinedOutput()
+		version := firstLine(strings.TrimSpace(string(out)))
 		if err != nil || version == "" {
 			resp.Tools[t.Name] = api.ToolInfo{Status: "missing", Version: "-"}
 		} else {
@@ -1061,6 +1086,16 @@ func handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func firstLine(s string) string {
+	if s == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return strings.TrimSpace(s[:idx])
+	}
+	return s
 }
 
 func janitor() {
@@ -1110,29 +1145,20 @@ func applyMounts(mounts []api.Mount) ([]string, error) {
 	for _, m := range mounts {
 		hostPath := filepath.Clean(m.HostPath)
 		guestPath := filepath.Clean(m.GuestPath)
-		// Validate HostPath is under /mnt/host
-		if hostPath != "/mnt/host" && !strings.HasPrefix(hostPath, "/mnt/host/") {
-			return nil, fmt.Errorf("host_path %s must be under /mnt/host", m.HostPath)
+		if err := validateHostPath(hostPath); err != nil {
+			return nil, err
 		}
 		// Validate GuestPath is under /workspace
 		if guestPath != "/workspace" && !strings.HasPrefix(guestPath, "/workspace/") {
 			return nil, fmt.Errorf("guest_path %s must be under /workspace (e.g. /workspace or /workspace/foo)", m.GuestPath)
 		}
-		// mkdir -p guestPath
-		if err := exec.Command("mkdir", "-p", guestPath).Run(); err != nil {
+		if err := os.MkdirAll(guestPath, 0755); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", guestPath, err)
 		}
-		// mount --bind hostPath guestPath
-		if out, err := exec.Command("mount", "--bind", hostPath, guestPath).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("mount --bind %s %s: %w\n%s", hostPath, guestPath, err, out)
+		if err := mountutil.BindMount(hostPath, guestPath, m.ReadOnly); err != nil {
+			return nil, err
 		}
 		mounted = append(mounted, guestPath)
-		if m.ReadOnly {
-			if out, err := exec.Command("mount", "-o", "remount,ro,bind", guestPath).CombinedOutput(); err != nil {
-				exec.Command("umount", guestPath).Run()
-				return nil, fmt.Errorf("remount ro %s: %w\n%s", guestPath, err, out)
-			}
-		}
 	}
 	return mounted, nil
 }
@@ -1150,17 +1176,14 @@ func applyOverlayMounts(jobID string, mounts []api.Mount) ([]*overlay.State, []s
 	for _, m := range mounts {
 		hostPath := filepath.Clean(m.HostPath)
 		guestPath := filepath.Clean(m.GuestPath)
-		if hostPath != "/mnt/host" && !strings.HasPrefix(hostPath, "/mnt/host/") {
-			return nil, nil, fmt.Errorf("host_path %s must be under /mnt/host", m.HostPath)
+		if err := validateHostPath(hostPath); err != nil {
+			return nil, nil, err
 		}
 		if guestPath != "/workspace" && !strings.HasPrefix(guestPath, "/workspace/") {
 			return nil, nil, fmt.Errorf("guest_path %s must be under /workspace", m.GuestPath)
 		}
-		// Each mount gets a unique sub-ID to support multiple mounts per job
-		subID := jobID
-		if len(mounts) > 1 {
-			subID = fmt.Sprintf("%s-%d", jobID, len(states))
-		}
+		// Each mount gets a unique sub-ID to support multiple mounts per job.
+		subID := overlaySubID(jobID, len(states), len(mounts))
 		st, err := overlay.Mount(subID, hostPath, guestPath)
 		if err != nil {
 			// Rollback already-created overlays
@@ -1186,10 +1209,39 @@ func cleanupMounts(paths []string) {
 		return
 	}
 	for i := len(paths) - 1; i >= 0; i-- {
-		if err := exec.Command("umount", paths[i]).Run(); err != nil {
+		if err := mountutil.Unmount(paths[i], 0); err != nil {
 			logging.Error("umount failed (best-effort)", "path", paths[i], "err", err)
 		}
 	}
+}
+
+func prepareExecutionMounts(mounts []api.Mount, useShadow bool) ([]api.Mount, error) {
+	if !useShadow || len(mounts) == 0 {
+		return mounts, nil
+	}
+	execMounts := make([]api.Mount, 0, len(mounts))
+	for _, m := range mounts {
+		hostPath := filepath.Clean(m.HostPath)
+		if hostPath == "/mnt/host" || strings.HasPrefix(hostPath, "/mnt/host/") {
+			localPath, err := shadow.Materialize(hostPath)
+			if err != nil {
+				return nil, err
+			}
+			m.HostPath = localPath
+		}
+		execMounts = append(execMounts, m)
+	}
+	return execMounts, nil
+}
+
+func validateHostPath(hostPath string) error {
+	if hostPath == "/mnt/host" || strings.HasPrefix(hostPath, "/mnt/host/") {
+		return nil
+	}
+	if shadow.IsManagedPath(hostPath) {
+		return nil
+	}
+	return fmt.Errorf("host_path %s must be under /mnt/host or %s", hostPath, shadow.DataDir)
 }
 
 // ensureDefaultDirs creates writable cache dirs for dev tools
@@ -1201,7 +1253,7 @@ func ensureDefaultDirs() error {
 		defaultNpmCache,
 	}
 	for _, d := range dirs {
-		if err := exec.Command("mkdir", "-p", d).Run(); err != nil {
+		if err := os.MkdirAll(d, 0755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}

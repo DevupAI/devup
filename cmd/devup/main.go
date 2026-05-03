@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"devup/internal/api"
+	"devup/internal/appfile"
 	"devup/internal/client"
 	"devup/internal/config"
 	"devup/internal/mounts"
@@ -37,6 +38,8 @@ func main() {
 		runVM(os.Args[2:], verbose)
 	case "dev":
 		runDev(os.Args[2:], verbose)
+	case "app":
+		runApp(os.Args[2:], verbose)
 	case "dashboard":
 		runDashboard(os.Args[2:], verbose)
 	case "ui":
@@ -75,6 +78,10 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  vm doctor     Check toolchain versions")
 	fmt.Fprintln(os.Stderr, "  dashboard      Interactive TUI (alias: ui)")
 	fmt.Fprintln(os.Stderr, "  dev [-f]       Start dev server (Node.js); -f to follow logs")
+	fmt.Fprintln(os.Stderr, "  app up         Start services from a devup app manifest")
+	fmt.Fprintln(os.Stderr, "  app down       Stop services from a devup app manifest")
+	fmt.Fprintln(os.Stderr, "  app ps         Show service state from a devup app manifest")
+	fmt.Fprintln(os.Stderr, "  app logs       Show logs for a manifest service")
 	fmt.Fprintln(os.Stderr, "  run [options] -- <cmd>  Run command (ephemeral)")
 	fmt.Fprintln(os.Stderr, "  start [options] -- <cmd>  Start background job")
 	fmt.Fprintln(os.Stderr, "  ps [--cluster] List jobs (--cluster shows discovered nodes)")
@@ -87,20 +94,25 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  devup dev -f           Start dev server and follow logs")
 	fmt.Fprintln(os.Stderr, "  devup logs -f           Follow logs of last started job")
 	fmt.Fprintln(os.Stderr, "  devup stop              Stop last started job")
+	fmt.Fprintln(os.Stderr, "  devup app up            Start all services from devup.app.yaml")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Run/Start Options:")
 	fmt.Fprintln(os.Stderr, "  --mount host:guest  Bind mount (default .:/workspace)")
 	fmt.Fprintln(os.Stderr, "  --workdir path      Working directory (default /workspace)")
+	fmt.Fprintln(os.Stderr, "  --profile name     Workload profile: batch|service|interactive")
 	fmt.Fprintln(os.Stderr, "  --memory MB         Memory limit (cgroups v2)")
 	fmt.Fprintln(os.Stderr, "  --cpu %             CPU limit (cgroups v2)")
 	fmt.Fprintln(os.Stderr, "  --pids N            PID limit (cgroups v2)")
 	fmt.Fprintln(os.Stderr, "  --overlay           OverlayFS isolation (host files read-only)")
+	fmt.Fprintln(os.Stderr, "  --shadow            Run from a VM-local shadow workspace (implies --overlay)")
 	fmt.Fprintln(os.Stderr, "  --net-isolate       Network namespace isolation")
 	fmt.Fprintln(os.Stderr, "  --isolate           Enable both --overlay and --net-isolate")
 	fmt.Fprintln(os.Stderr, "  --cluster           Schedule on best available node in the cluster")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Global Options:")
 	fmt.Fprintln(os.Stderr, "  --verbose           Print detailed commands")
+	fmt.Fprintln(os.Stderr, "Dashboard Options:")
+	fmt.Fprintln(os.Stderr, "  --bench-file path   Benchmark JSON to show in the dashboard")
 }
 
 func hasFlag(name string) bool {
@@ -208,7 +220,7 @@ func runVM(args []string, verbose bool) {
 func runRun(args []string, verbose bool) {
 	idx := findDoubleDash(args)
 	if idx < 0 || idx+1 >= len(args) {
-		fmt.Fprintln(os.Stderr, "Usage: devup run [--mount host:guest]... [--workdir path] [--memory MB] [--cpu %] [--pids N] [--cluster] -- <cmd> [args...]")
+		fmt.Fprintln(os.Stderr, "Usage: devup run [--mount host:guest]... [--workdir path] [--profile name] [--memory MB] [--cpu %] [--pids N] [--cluster] -- <cmd> [args...]")
 		fmt.Fprintln(os.Stderr, "Example: devup run -- echo hello")
 		fmt.Fprintln(os.Stderr, "Example: devup run --cluster -- make build")
 		os.Exit(1)
@@ -221,6 +233,9 @@ func runRun(args []string, verbose bool) {
 		fmt.Fprintln(os.Stderr, "For V1, mounts must be within your home directory so Lima can share them.")
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	if opts.Profile == "" {
+		opts.Profile = api.ProfileBatch
 	}
 
 	ctx, cfg, c, err := ensureReady(verbose, false)
@@ -239,9 +254,11 @@ func runRun(args []string, verbose bool) {
 		Cmd:        cmd,
 		Env:        util.EnvMap(),
 		Cwd:        opts.Workdir,
+		Profile:    opts.Profile,
 		Mounts:     opts.Mounts,
 		Limits:     opts.Limits,
 		Overlay:    opts.Overlay,
+		Shadow:     opts.Shadow,
 		NetIsolate: opts.NetIsolate,
 	}
 	exitCode, err := c.Run(ctx, req, os.Stdout)
@@ -255,7 +272,7 @@ func runRun(args []string, verbose bool) {
 func runStart(args []string, verbose bool) {
 	idx := findDoubleDash(args)
 	if idx < 0 || idx+1 >= len(args) {
-		fmt.Fprintln(os.Stderr, "Usage: devup start [--mount host:guest]... [--workdir path] [--memory MB] [--cpu %] [--pids N] [--cluster] -- <cmd> [args...]")
+		fmt.Fprintln(os.Stderr, "Usage: devup start [--mount host:guest]... [--workdir path] [--profile name] [--memory MB] [--cpu %] [--pids N] [--cluster] -- <cmd> [args...]")
 		fmt.Fprintln(os.Stderr, "Example: devup start --cluster -- npm run dev")
 		os.Exit(1)
 	}
@@ -267,6 +284,9 @@ func runStart(args []string, verbose bool) {
 		fmt.Fprintln(os.Stderr, "For V1, mounts must be within your home directory so Lima can share them.")
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	if opts.Profile == "" {
+		opts.Profile = api.ProfileService
 	}
 
 	ctx, cfg, c, err := ensureReady(verbose, false)
@@ -285,9 +305,11 @@ func runStart(args []string, verbose bool) {
 		Cmd:        cmd,
 		Env:        util.EnvMap(),
 		Cwd:        opts.Workdir,
+		Profile:    opts.Profile,
 		Mounts:     opts.Mounts,
 		Limits:     opts.Limits,
 		Overlay:    opts.Overlay,
+		Shadow:     opts.Shadow,
 		NetIsolate: opts.NetIsolate,
 	}
 	jobID, err := c.Start(ctx, req)
@@ -378,9 +400,11 @@ func runRunCluster(ctx context.Context, cfg *config.Config, localClient *client.
 			Cmd:        cmd,
 			Env:        util.EnvMap(),
 			Cwd:        workdir,
+			Profile:    opts.Profile,
 			Mounts:     reqMounts,
 			Limits:     opts.Limits,
 			Overlay:    opts.Overlay,
+			Shadow:     opts.Shadow && peer.Status == "local",
 			NetIsolate: opts.NetIsolate,
 		}
 
@@ -440,9 +464,11 @@ func runStartCluster(ctx context.Context, cfg *config.Config, localClient *clien
 			Cmd:        cmd,
 			Env:        util.EnvMap(),
 			Cwd:        workdir,
+			Profile:    opts.Profile,
 			Mounts:     reqMounts,
 			Limits:     opts.Limits,
 			Overlay:    opts.Overlay,
+			Shadow:     opts.Shadow && peer.Status == "local",
 			NetIsolate: opts.NetIsolate,
 		}
 
@@ -481,8 +507,10 @@ func findDoubleDash(args []string) int {
 type runStartOpts struct {
 	Mounts     []api.Mount
 	Workdir    string
+	Profile    string
 	Limits     *api.ResourceLimits
 	Overlay    bool
+	Shadow     bool
 	NetIsolate bool
 	Cluster    bool
 }
@@ -511,6 +539,11 @@ func parseRunStartFlags(flags []string) (*runStartOpts, error) {
 				opts.Workdir = flags[i+1]
 				i++
 			}
+		case "--profile":
+			if i+1 < len(flags) {
+				opts.Profile = api.NormalizeProfile(flags[i+1])
+				i++
+			}
 		case "--memory":
 			if i+1 < len(flags) {
 				if n, err := strconv.Atoi(flags[i+1]); err == nil && n > 0 {
@@ -536,6 +569,9 @@ func parseRunStartFlags(flags []string) (*runStartOpts, error) {
 				i++
 			}
 		case "--overlay":
+			opts.Overlay = true
+		case "--shadow":
+			opts.Shadow = true
 			opts.Overlay = true
 		case "--net-isolate":
 			opts.NetIsolate = true
@@ -578,28 +614,21 @@ func runPs(args []string, verbose bool) {
 	}
 
 	now := time.Now().Unix()
-	fmt.Printf("%-10s %-10s %-10s %-12s %s\n", "JOB_ID", "STATUS", "UPTIME", "MEM/CPU", "CMD")
+	if verbose {
+		fmt.Printf("%-10s %-10s %-12s %-10s %-22s %-12s %s\n", "JOB_ID", "STATUS", "PROFILE", "UPTIME", "MEMORY", "LIMITS", "CMD")
+	} else {
+		fmt.Printf("%-10s %-10s %-10s %-12s %s\n", "JOB_ID", "STATUS", "UPTIME", "MEM/CPU", "CMD")
+	}
 	for _, j := range jobs {
 		uptime := formatUptime(j.StartedAt, j.FinishedAt, now)
 		cmdStr := strings.Join(j.Cmd, " ")
 		if len(cmdStr) > 50 {
 			cmdStr = cmdStr[:47] + "..."
 		}
-		limitsStr := "-"
-		if j.Limits != nil {
-			parts := make([]string, 0, 2)
-			if j.Limits.MemoryMB > 0 {
-				parts = append(parts, fmt.Sprintf("%dM", j.Limits.MemoryMB))
-			}
-			if j.Limits.CPUPercent > 0 {
-				parts = append(parts, fmt.Sprintf("%d%%", j.Limits.CPUPercent))
-			}
-			if j.Limits.PidsMax > 0 {
-				parts = append(parts, fmt.Sprintf("%dp", j.Limits.PidsMax))
-			}
-			if len(parts) > 0 {
-				limitsStr = strings.Join(parts, "/")
-			}
+		limitsStr := formatJobLimits(j.Limits)
+		if verbose {
+			fmt.Printf("%-10s %-10s %-12s %-10s %-22s %-12s %s\n", j.JobID, j.Status, formatJobProfile(j.Profile), uptime, formatJobMemory(j.Memory), limitsStr, cmdStr)
+			continue
 		}
 		fmt.Printf("%-10s %-10s %-10s %-12s %s\n", j.JobID, j.Status, uptime, limitsStr, cmdStr)
 	}
@@ -650,17 +679,54 @@ func formatUptime(started, finished, now int64) string {
 	return fmt.Sprintf("%dh%dm", sec/3600, (sec%3600)/60)
 }
 
-func runLogs(args []string, verbose bool) {
-	follow := false
-	var jobID string
-	for _, a := range args {
-		if a == "--follow" || a == "-f" {
-			follow = true
-		} else if a != "" && !strings.HasPrefix(a, "-") {
-			jobID = a
-			break
-		}
+func formatJobLimits(limits *api.ResourceLimits) string {
+	if limits == nil {
+		return "-"
 	}
+
+	parts := make([]string, 0, 3)
+	if limits.MemoryMB > 0 {
+		parts = append(parts, fmt.Sprintf("%dM", limits.MemoryMB))
+	}
+	if limits.CPUPercent > 0 {
+		parts = append(parts, fmt.Sprintf("%d%%", limits.CPUPercent))
+	}
+	if limits.PidsMax > 0 {
+		parts = append(parts, fmt.Sprintf("%dp", limits.PidsMax))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, "/")
+}
+
+func formatJobProfile(profile string) string {
+	if profile == "" {
+		return api.ProfileService
+	}
+	return profile
+}
+
+func formatJobMemory(memory *api.MemoryStatus) string {
+	if memory == nil {
+		return "-"
+	}
+
+	if memory.CurrentMB > 0 || memory.LowMB > 0 || memory.HighMB > 0 || memory.MaxMB > 0 {
+		maxPart := "max"
+		if memory.MaxMB > 0 {
+			maxPart = fmt.Sprintf("%dM", memory.MaxMB)
+		}
+		return fmt.Sprintf("%d/%d/%d/%s", memory.CurrentMB, memory.LowMB, memory.HighMB, maxPart)
+	}
+	if memory.Adaptive {
+		return "adaptive"
+	}
+	return "-"
+}
+
+func runLogs(args []string, verbose bool) {
+	jobID, follow := parseLogsArgs(args)
 	if jobID == "" {
 		var err error
 		jobID, err = config.ReadLastJob()
@@ -679,6 +745,18 @@ func runLogs(args []string, verbose bool) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func parseLogsArgs(args []string) (jobID string, follow bool) {
+	for _, a := range args {
+		switch {
+		case a == "--follow" || a == "-f":
+			follow = true
+		case a != "" && !strings.HasPrefix(a, "-") && jobID == "":
+			jobID = a
+		}
+	}
+	return jobID, follow
 }
 
 func runStop(args []string, verbose bool) {
@@ -716,12 +794,287 @@ func runStop(args []string, verbose bool) {
 	fmt.Printf("Stopped job %s\n", jobID)
 }
 
+func runApp(args []string, verbose bool) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: devup app {up|down|ps|logs} [options]")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "up":
+		runAppUp(args[1:], verbose)
+	case "down":
+		runAppDown(args[1:], verbose)
+	case "ps":
+		runAppPs(args[1:], verbose)
+	case "logs":
+		runAppLogs(args[1:], verbose)
+	default:
+		fmt.Fprintln(os.Stderr, "Unknown app command:", args[0])
+		os.Exit(1)
+	}
+}
+
+func runAppUp(args []string, verbose bool) {
+	manifestPath, targets, err := parseAppFlags(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	app, err := loadResolvedApp(manifestPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	services, err := app.StartOrder(targets)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	ctx, _, c, err := ensureReady(verbose, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	jobs, err := c.Ps(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	jobIndex := jobsByID(jobs)
+	state, _ := config.ReadAppState(app.ManifestPath)
+	if state == nil {
+		state = &config.AppState{
+			Name:         app.Name,
+			ManifestPath: app.ManifestPath,
+			Services:     make(map[string]config.AppServiceState),
+		}
+	}
+	started := make([]config.AppServiceState, 0, len(services))
+	lastStarted := ""
+	for _, svc := range services {
+		if entry, ok := state.Services[svc.Name]; ok {
+			if job, ok := jobIndex[entry.JobID]; ok && job.Status == "running" {
+				fmt.Printf("%s already running as %s\n", svc.Name, entry.JobID)
+				continue
+			}
+		}
+		req := &api.StartRequest{
+			RequestID:  util.GenerateRequestID(),
+			Cmd:        svc.Cmd,
+			Env:        mergedEnv(svc.Env),
+			Cwd:        svc.Workdir,
+			Profile:    svc.Profile,
+			Mounts:     svc.Mounts,
+			Limits:     svc.Limits,
+			Overlay:    svc.Overlay,
+			Shadow:     svc.Shadow,
+			NetIsolate: svc.NetIsolate,
+		}
+		jobID, err := c.Start(ctx, req)
+		if err != nil {
+			rollbackAppStarts(ctx, c, started)
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("%s %s\n", svc.Name, jobID)
+		lastStarted = jobID
+		state.Services[svc.Name] = config.AppServiceState{
+			JobID:     jobID,
+			Profile:   svc.Profile,
+			Cmd:       append([]string(nil), svc.Cmd...),
+			StartedAt: time.Now().Unix(),
+		}
+		started = append(started, state.Services[svc.Name])
+	}
+	state.Name = app.Name
+	state.ManifestPath = app.ManifestPath
+	state.UpdatedAt = time.Now().Unix()
+	if len(state.Services) == 0 {
+		if err := config.DeleteAppState(app.ManifestPath); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not remove app state:", err)
+		}
+	} else if err := config.WriteAppState(app.ManifestPath, state); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not save app state:", err)
+	}
+	if lastStarted != "" {
+		if err := config.WriteLastJob(lastStarted); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not save last job:", err)
+		}
+	}
+}
+
+func runAppDown(args []string, verbose bool) {
+	manifestPath, targets, err := parseAppFlags(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	app, err := loadResolvedApp(manifestPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	state, err := config.ReadAppState(app.ManifestPath)
+	if err != nil {
+		fmt.Println("No tracked app services.")
+		return
+	}
+	services, err := app.ExactOrder(targets, true)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	ctx, _, c, err := ensureReady(verbose, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	for _, svc := range services {
+		entry, ok := state.Services[svc.Name]
+		if !ok || entry.JobID == "" {
+			continue
+		}
+		if err := c.Stop(ctx, entry.JobID); err != nil && !strings.Contains(err.Error(), "job not found") {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Stopped %s (%s)\n", svc.Name, entry.JobID)
+		delete(state.Services, svc.Name)
+	}
+	if len(targets) == 0 {
+		for name, entry := range state.Services {
+			if entry.JobID == "" {
+				delete(state.Services, name)
+				continue
+			}
+			if err := c.Stop(ctx, entry.JobID); err != nil && !strings.Contains(err.Error(), "job not found") {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			fmt.Printf("Stopped %s (%s)\n", name, entry.JobID)
+			delete(state.Services, name)
+		}
+	}
+	if len(state.Services) == 0 {
+		if err := config.DeleteAppState(app.ManifestPath); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: could not remove app state:", err)
+		}
+		return
+	}
+	state.UpdatedAt = time.Now().Unix()
+	if err := config.WriteAppState(app.ManifestPath, state); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not save app state:", err)
+	}
+}
+
+func runAppPs(args []string, verbose bool) {
+	manifestPath, targets, err := parseAppFlags(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	app, err := loadResolvedApp(manifestPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	services, err := app.ExactOrder(targets, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	state, _ := config.ReadAppState(app.ManifestPath)
+	if state == nil {
+		state = &config.AppState{Services: make(map[string]config.AppServiceState)}
+	}
+	ctx, _, c, err := ensureReady(verbose, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	jobs, err := c.Ps(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	jobIndex := jobsByID(jobs)
+	fmt.Printf("%-14s %-10s %-10s %-12s %s\n", "SERVICE", "JOB_ID", "STATUS", "PROFILE", "CMD")
+	for _, svc := range services {
+		entry, ok := state.Services[svc.Name]
+		jobID := "-"
+		status := "stopped"
+		profile := svc.Profile
+		cmdStr := strings.Join(svc.Cmd, " ")
+		if ok && entry.JobID != "" {
+			jobID = entry.JobID
+			if job, ok := jobIndex[entry.JobID]; ok {
+				status = job.Status
+				if job.Profile != "" {
+					profile = job.Profile
+				}
+				if len(job.Cmd) > 0 {
+					cmdStr = strings.Join(job.Cmd, " ")
+				}
+			}
+		}
+		if len(cmdStr) > 50 {
+			cmdStr = cmdStr[:47] + "..."
+		}
+		fmt.Printf("%-14s %-10s %-10s %-12s %s\n", svc.Name, jobID, status, profile, cmdStr)
+	}
+}
+
+func runAppLogs(args []string, verbose bool) {
+	manifestPath, serviceName, follow, err := parseAppLogsFlags(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	app, err := loadResolvedApp(manifestPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if serviceName == "" && len(app.Services) == 1 {
+		for name := range app.Services {
+			serviceName = name
+		}
+	}
+	if serviceName == "" {
+		fmt.Fprintln(os.Stderr, "app logs requires a service name when the manifest has multiple services")
+		os.Exit(1)
+	}
+	state, err := config.ReadAppState(app.ManifestPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	entry, ok := state.Services[serviceName]
+	if !ok || entry.JobID == "" {
+		fmt.Fprintln(os.Stderr, "service is not running:", serviceName)
+		os.Exit(1)
+	}
+	ctx, _, c, err := ensureReady(verbose, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := c.Logs(ctx, entry.JobID, follow, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
 func runDashboard(args []string, verbose bool) {
 	noVMUp := false
+	benchPath := ""
 	refreshMs := 2000
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--no-vm-up" {
 			noVMUp = true
+		} else if args[i] == "--bench-file" && i+1 < len(args) {
+			i++
+			benchPath = args[i]
 		} else if args[i] == "--refresh-ms" && i+1 < len(args) {
 			i++
 			if n, err := parseRefreshMs(args[i]); err == nil {
@@ -729,7 +1082,7 @@ func runDashboard(args []string, verbose bool) {
 			}
 		}
 	}
-	if err := dashboard.RunDashboard(noVMUp, refreshMs, verbose); err != nil {
+	if err := dashboard.RunDashboard(noVMUp, benchPath, refreshMs, verbose); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -780,7 +1133,7 @@ func runDev(args []string, verbose bool) {
 				Cmd:       []string{"npm", "install"},
 				Env:       util.EnvMap(),
 				Cwd:       "/workspace",
-		
+				Profile:   api.ProfileBatch,
 				Mounts:    mountList,
 			}
 			if _, err := c.Run(ctx, req, os.Stdout); err != nil {
@@ -794,7 +1147,7 @@ func runDev(args []string, verbose bool) {
 			Cmd:       devCmd,
 			Env:       util.EnvMap(),
 			Cwd:       "/workspace",
-	
+			Profile:   api.ProfileInteractive,
 			Mounts:    mountList,
 		}
 		jobID, err := c.Start(ctx, req)
@@ -822,6 +1175,90 @@ func parseRefreshMs(s string) (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+func parseAppFlags(args []string) (manifestPath string, services []string, err error) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--file":
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--file requires a path")
+			}
+			manifestPath = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", nil, fmt.Errorf("unknown app option %s", args[i])
+			}
+			services = append(services, args[i])
+		}
+	}
+	return manifestPath, services, nil
+}
+
+func parseAppLogsFlags(args []string) (manifestPath string, serviceName string, follow bool, err error) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--file":
+			if i+1 >= len(args) {
+				return "", "", false, fmt.Errorf("--file requires a path")
+			}
+			manifestPath = args[i+1]
+			i++
+		case "-f", "--follow":
+			follow = true
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", "", false, fmt.Errorf("unknown app logs option %s", args[i])
+			}
+			if serviceName == "" {
+				serviceName = args[i]
+				continue
+			}
+			return "", "", false, fmt.Errorf("unexpected argument %s", args[i])
+		}
+	}
+	return manifestPath, serviceName, follow, nil
+}
+
+func loadResolvedApp(manifestPath string) (*appfile.ResolvedFile, error) {
+	path := strings.TrimSpace(manifestPath)
+	if path == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		path, err = appfile.DefaultPath(cwd)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return appfile.Resolve(path)
+}
+
+func jobsByID(jobs []api.JobInfo) map[string]api.JobInfo {
+	index := make(map[string]api.JobInfo, len(jobs))
+	for _, job := range jobs {
+		index[job.JobID] = job
+	}
+	return index
+}
+
+func mergedEnv(overrides map[string]string) map[string]string {
+	env := util.EnvMap()
+	for k, v := range overrides {
+		env[k] = v
+	}
+	return env
+}
+
+func rollbackAppStarts(ctx context.Context, c *client.Client, started []config.AppServiceState) {
+	for i := len(started) - 1; i >= 0; i-- {
+		if started[i].JobID == "" {
+			continue
+		}
+		_ = c.Stop(ctx, started[i].JobID)
+	}
 }
 
 func runDown(verbose bool) {
@@ -861,9 +1298,7 @@ func runVMProvision(verbose bool) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	out, err := vm.ShellCmd(ctx, "sudo bash /tmp/devup-provision.sh")
-	fmt.Print(out)
-	if err != nil {
+	if err := vm.ShellCmdStreaming(ctx, "sudo bash /tmp/devup-provision.sh"); err != nil {
 		fmt.Fprintln(os.Stderr, "provision failed:", err)
 		os.Exit(1)
 	}
@@ -890,7 +1325,7 @@ func runVMDoctor(verbose bool) {
 		fmt.Fprintln(os.Stderr, "doctor:", err)
 		os.Exit(1)
 	}
-	toolOrder := []string{"node", "npm", "python3", "pip", "go", "gcc", "g++", "make", "cmake", "pnpm", "mise"}
+	toolOrder := []string{"node", "npm", "python3", "pip", "go", "ruby", "java", "cargo", "rustc", "php", "composer", "gcc", "g++", "make", "cmake", "pnpm", "mise"}
 	fmt.Printf("%-10s %-10s %s\n", "TOOL", "STATUS", "VERSION")
 	for _, name := range toolOrder {
 		t, ok := info.Tools[name]
@@ -905,4 +1340,3 @@ func runVMDoctor(verbose bool) {
 		fmt.Printf("%-10s %-10s %s\n", name, t.Status, ver)
 	}
 }
-

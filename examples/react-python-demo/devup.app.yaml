@@ -1,0 +1,22 @@
+name: react-python-demo
+services:
+  backend:
+    command: ["python3", "server.py"]
+    workdir: /workspace/react-python-demo-backend/backend
+    profile: service
+    shadow: true
+    mounts:
+      - .:/workspace/react-python-demo-backend
+  frontend:
+    command:
+      [
+        "sh",
+        "-lc",
+        "npm install --no-fund --no-audit && npm run dev -- --host 0.0.0.0 --port 3000",
+      ]
+    workdir: /workspace/react-python-demo-frontend/frontend
+    profile: interactive
+    shadow: true
+    depends_on: ["backend"]
+    mounts:
+      - .:/workspace/react-python-demo-frontend

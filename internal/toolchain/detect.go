@@ -10,15 +10,15 @@ import (
 
 // Requirement describes a single tool needed by a workspace.
 type Requirement struct {
-	Tool    string // mise tool name: "node", "go", "python", "rust", "ruby", "java"
+	Tool    string // mise tool name: "node", "go", "python", "rust", "ruby", "java", "php"
 	Version string // version spec: "20", "1.22", "3.12", "latest"
 	Source  string // file that triggered detection: "package.json", "go.mod", etc.
 }
 
 // DetectResult holds the output of workspace language detection.
 type DetectResult struct {
-	Reqs     []Requirement
-	HasMise  bool // .mise.toml or .tool-versions exists; mise handles everything
+	Reqs    []Requirement
+	HasMise bool // .mise.toml or .tool-versions exists; mise handles everything
 }
 
 // Detect scans workdir for language marker files and returns tool requirements.
@@ -54,6 +54,17 @@ func Detect(workdir string) DetectResult {
 
 	if fileExists(filepath.Join(workdir, "Gemfile")) {
 		reqs = append(reqs, Requirement{Tool: "ruby", Version: "latest", Source: "Gemfile"})
+	}
+
+	for _, f := range []string{"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"} {
+		if fileExists(filepath.Join(workdir, f)) {
+			reqs = append(reqs, Requirement{Tool: "java", Version: "latest", Source: f})
+			break
+		}
+	}
+
+	if fileExists(filepath.Join(workdir, "composer.json")) {
+		reqs = append(reqs, Requirement{Tool: "php", Version: "latest", Source: "composer.json"})
 	}
 
 	return DetectResult{Reqs: reqs}

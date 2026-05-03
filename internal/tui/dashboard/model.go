@@ -21,13 +21,17 @@ const (
 )
 
 var (
-	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("212"))
-	footerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("240"))
-	statusErrStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("196"))
+	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230"))
+	footerStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	statusErrStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	mutedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	cardStyle      = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("67")).
+			Padding(0, 1)
+	cardTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("151"))
+	cardValueStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230"))
+	accentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("80")).Bold(true)
 )
 
 type Model struct {
@@ -35,11 +39,12 @@ type Model struct {
 	client     *client.Client
 	configPath string
 	refreshMs  int
+	benchPath  string
 
 	// View state
-	view       int
-	verbose    bool
-	showDebug  bool
+	view      int
+	verbose   bool
+	showDebug bool
 
 	// Jobs list
 	jobs       []api.JobInfo
@@ -47,28 +52,31 @@ type Model struct {
 	tableModel table.Model
 
 	// VM/Agent status (cached, async)
-	vmRunning     bool
-	vmStatusAt    time.Time
-	health        HealthState
-	lastError     error
+	vmRunning    bool
+	vmStatusAt   time.Time
+	health       HealthState
+	lastError    error
+	benchSummary *benchSummary
 
 	// Logs view
-	logsContent   string
-	logsJobID     string
-	logsFollow    bool
+	logsContent     string
+	logsJobID       string
+	logsFollow      bool
 	logStreamCancel context.CancelFunc
-	logStreamMu    sync.Mutex
+	logStreamMu     sync.Mutex
 
 	// Start modal
-	cmdInput   textinput.Model
-	mountInput textinput.Model
-	focusIdx   int
+	cmdInput     textinput.Model
+	mountInput   textinput.Model
+	focusIdx     int
+	startProfile string
+	startShadow  bool
 
 	// Program ref for log streaming
 	program *tea.Program
 }
 
-func NewModel(cfg *config.Config, configPath string, refreshMs int, verbose bool) *Model {
+func NewModel(cfg *config.Config, configPath string, benchPath string, refreshMs int, verbose bool) *Model {
 	cmdInput := textinput.New()
 	cmdInput.Placeholder = "python3 -m http.server 8000"
 	cmdInput.Width = 50
@@ -81,8 +89,10 @@ func NewModel(cfg *config.Config, configPath string, refreshMs int, verbose bool
 	columns := []table.Column{
 		{Title: "JOB_ID", Width: 10},
 		{Title: "STATUS", Width: 10},
+		{Title: "PROFILE", Width: 12},
+		{Title: "MEM", Width: 14},
 		{Title: "UPTIME", Width: 10},
-		{Title: "CMD", Width: 40},
+		{Title: "CMD", Width: 36},
 	}
 
 	t := table.New(
@@ -93,17 +103,20 @@ func NewModel(cfg *config.Config, configPath string, refreshMs int, verbose bool
 	)
 
 	return &Model{
-		client:     client.New(cfg.Token),
-		configPath: configPath,
-		refreshMs:  refreshMs,
-		verbose:    verbose,
-		jobs:       nil,
-		selected:   0,
-		tableModel: t,
-		view:       ViewJobsList,
-		cmdInput:   cmdInput,
-		mountInput: mountInput,
-		focusIdx:   0,
+		client:       client.New(cfg.Token),
+		configPath:   configPath,
+		refreshMs:    refreshMs,
+		benchPath:    benchPath,
+		verbose:      verbose,
+		jobs:         nil,
+		selected:     0,
+		tableModel:   t,
+		view:         ViewJobsList,
+		cmdInput:     cmdInput,
+		mountInput:   mountInput,
+		focusIdx:     0,
+		startProfile: api.ProfileService,
+		startShadow:  false,
 	}
 }
 
@@ -118,6 +131,7 @@ func (m *Model) Init() tea.Cmd {
 		fetchVmStatusCmd(),
 		fetchPsCmd(m.client),
 		fetchHealthCmd(m.client),
+		fetchBenchCmd(m.benchPath),
 	)
 }
 

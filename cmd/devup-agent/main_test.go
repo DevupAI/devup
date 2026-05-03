@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"devup/internal/api"
+	"devup/internal/ringbuffer"
 )
 
 func TestHandleRunRejectsOversizedJSONBody(t *testing.T) {
@@ -98,6 +101,92 @@ func TestWaitForDoneTimesOutWhenChannelStaysOpen(t *testing.T) {
 	close(done)
 	if !waitForDone(done, 0) {
 		t.Fatal("expected closed channel to return immediately")
+	}
+}
+
+func TestHandleLogsFollowFlushesFinalBufferedOutput(t *testing.T) {
+	jobsMu.Lock()
+	prevJobs := jobs
+	jobs = make(map[string]*job)
+	jobsMu.Unlock()
+	t.Cleanup(func() {
+		jobsMu.Lock()
+		jobs = prevJobs
+		jobsMu.Unlock()
+	})
+
+	j := &job{
+		logBuf:    ringbuffer.New(1024),
+		broadcast: make(chan []byte, 1),
+		done:      make(chan struct{}),
+	}
+
+	jobsMu.Lock()
+	jobs["job-1"] = j
+	jobsMu.Unlock()
+	t.Cleanup(func() {
+		jobsMu.Lock()
+		delete(jobs, "job-1")
+		jobsMu.Unlock()
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/logs?id=job-1&follow=1", nil)
+	rec := httptest.NewRecorder()
+
+	handlerDone := make(chan struct{})
+	go func() {
+		handleLogs(rec, req)
+		close(handlerDone)
+	}()
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for !rec.Flushed && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !rec.Flushed {
+		t.Fatal("handler did not enter follow mode")
+	}
+
+	if _, err := j.logBuf.Write([]byte("done\n")); err != nil {
+		t.Fatalf("logBuf.Write returned error: %v", err)
+	}
+	close(j.done)
+
+	select {
+	case <-handlerDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("follow request did not exit after job completion")
+	}
+
+	if body := rec.Body.String(); !strings.Contains(body, "done\n") {
+		t.Fatalf("expected follow response to include final buffered output, got %q", body)
+	}
+}
+
+func TestResolveExecutionWorkdirMapsGuestPathIntoMountedTree(t *testing.T) {
+	mounts := []api.Mount{
+		{HostPath: "/var/lib/devup/shadow/app", GuestPath: "/workspace"},
+	}
+
+	got := resolveExecutionWorkdir(mounts, "/workspace/frontend")
+	want := filepath.Clean("/var/lib/devup/shadow/app/frontend")
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestOverlayStateDirsUsesStablePerMountIDs(t *testing.T) {
+	dirs := overlayStateDirs("job-1", []api.Mount{
+		{HostPath: "/mnt/host/a", GuestPath: "/workspace/a"},
+		{HostPath: "/mnt/host/b", GuestPath: "/workspace/b"},
+	}, true)
+
+	want := []string{
+		"/var/lib/devup/overlay/job-1-0",
+		"/var/lib/devup/overlay/job-1-1",
+	}
+	if strings.Join(dirs, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected %v, got %v", want, dirs)
 	}
 }
 

@@ -1,11 +1,14 @@
 package dashboard
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"devup/internal/api"
+
 	"github.com/charmbracelet/bubbles/table"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -29,6 +32,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.health.OK = msg.ok
 		m.health.Latency = msg.latency
 		m.health.Err = msg.err
+		if msg.err != nil {
+			m.lastError = msg.err
+		}
+		return m, nil
+	case benchResultMsg:
+		m.benchSummary = msg.summary
 		if msg.err != nil {
 			m.lastError = msg.err
 		}
@@ -62,7 +71,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cmdInput.SetValue("")
 			m.mountInput.SetValue(".:/workspace")
 			m.focusIdx = 0
-			return m, fetchPsCmd(m.client)
+			m.startProfile = api.ProfileService
+			m.startShadow = false
+			return m, tea.Batch(fetchPsCmd(m.client), fetchBenchCmd(m.benchPath))
 		}
 		return m, nil
 	case errorMsg:
@@ -77,6 +88,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.view {
 	case ViewJobsList:
 		return m.handleJobsListKey(msg)
+	case ViewBenchmarks:
+		return m.handleBenchmarksKey(msg)
 	case ViewLogs:
 		return m.handleLogsKey(msg)
 	case ViewStartModal:
@@ -96,6 +109,7 @@ func (m *Model) handleJobsListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			fetchVmStatusCmd(),
 			fetchPsCmd(m.client),
 			fetchHealthCmd(m.client),
+			fetchBenchCmd(m.benchPath),
 		)
 	case "enter":
 		if len(m.jobs) == 0 {
@@ -127,8 +141,13 @@ func (m *Model) handleJobsListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = ViewStartModal
 		m.focusIdx = 0
 		m.lastError = nil
+		m.startProfile = api.ProfileService
+		m.startShadow = false
 		m.cmdInput.Focus()
 		m.mountInput.Blur()
+		return m, nil
+	case "b":
+		m.view = ViewBenchmarks
 		return m, nil
 	case "d":
 		return m, tea.Batch(downCmd(m.client), fetchPsCmd(m.client))
@@ -139,6 +158,26 @@ func (m *Model) handleJobsListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.tableModel, cmd = m.tableModel.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) handleBenchmarksKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "j", "esc", "b":
+		m.view = ViewJobsList
+		return m, nil
+	case "r":
+		interval := time.Duration(m.refreshMs) * time.Millisecond
+		return m, tea.Batch(
+			tickCmd(interval),
+			fetchVmStatusCmd(),
+			fetchPsCmd(m.client),
+			fetchHealthCmd(m.client),
+			fetchBenchCmd(m.benchPath),
+		)
+	}
+	return m, nil
 }
 
 func (m *Model) handleLogsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -174,6 +213,8 @@ func (m *Model) handleStartModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = ViewJobsList
 		m.cmdInput.SetValue("")
 		m.mountInput.SetValue(".:/workspace")
+		m.startProfile = api.ProfileService
+		m.startShadow = false
 		return m, nil
 	case "enter":
 		if m.focusIdx == 0 {
@@ -188,7 +229,7 @@ func (m *Model) handleStartModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			mountStr = ".:/workspace"
 		}
 		m.view = ViewJobsList
-		return m, startJobCmd(m.client, cmdStr, mountStr)
+		return m, startJobCmd(m.client, cmdStr, mountStr, m.startProfile, m.startShadow)
 	case "tab":
 		// toggle focus
 		if m.focusIdx == 0 {
@@ -200,6 +241,12 @@ func (m *Model) handleStartModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mountInput.Blur()
 			m.cmdInput.Focus()
 		}
+		return m, nil
+	case "p":
+		m.startProfile = nextProfile(m.startProfile)
+		return m, nil
+	case "x":
+		m.startShadow = !m.startShadow
 		return m, nil
 	}
 	if m.focusIdx == 0 {
@@ -220,6 +267,7 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleTick() (tea.Model, tea.Cmd) {
 	interval := time.Duration(m.refreshMs) * time.Millisecond
 	cmds := []tea.Cmd{tickCmd(interval), fetchPsCmd(m.client), fetchHealthCmd(m.client)}
+	cmds = append(cmds, fetchBenchCmd(m.benchPath))
 	if time.Since(m.vmStatusAt) >= vmStatusRefreshInterval {
 		cmds = append(cmds, fetchVmStatusCmd())
 	}
@@ -232,10 +280,56 @@ func (m *Model) updateTableRows() {
 	for _, j := range m.jobs {
 		uptime := formatUptime(j.StartedAt, j.FinishedAt, now)
 		cmdStr := strings.Join(j.Cmd, " ")
-		if len(cmdStr) > 37 {
-			cmdStr = cmdStr[:34] + "..."
+		if len(cmdStr) > 33 {
+			cmdStr = cmdStr[:30] + "..."
 		}
-		rows = append(rows, table.Row{j.JobID, j.Status, uptime, cmdStr})
+		rows = append(rows, table.Row{
+			j.JobID,
+			j.Status,
+			formatProfile(j.Profile),
+			formatDashboardMemory(j.Memory),
+			uptime,
+			cmdStr,
+		})
 	}
 	m.tableModel.SetRows(rows)
+}
+
+func nextProfile(profile string) string {
+	switch api.NormalizeProfile(profile) {
+	case api.ProfileBatch:
+		return api.ProfileService
+	case api.ProfileService:
+		return api.ProfileInteractive
+	default:
+		return api.ProfileBatch
+	}
+}
+
+func formatProfile(profile string) string {
+	if profile == "" {
+		return api.ProfileService
+	}
+	return profile
+}
+
+func formatDashboardMemory(memory *api.MemoryStatus) string {
+	if memory == nil {
+		return "-"
+	}
+	switch {
+	case memory.HighMB > 0:
+		return strings.TrimSpace(formatNumber(memory.CurrentMB) + "/" + formatNumber(memory.HighMB) + "M")
+	case memory.MaxMB > 0:
+		return strings.TrimSpace(formatNumber(memory.CurrentMB) + "/" + formatNumber(memory.MaxMB) + "M")
+	default:
+		return formatNumber(memory.CurrentMB) + "M"
+	}
+}
+
+func formatNumber(n int) string {
+	if n <= 0 {
+		return "0"
+	}
+	return strconv.Itoa(n)
 }

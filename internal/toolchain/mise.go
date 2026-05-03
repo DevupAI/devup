@@ -33,7 +33,12 @@ func EnsureForWorkdir(workdir string) (map[string]string, error) {
 		return nil, nil
 	}
 
-	if err := Ensure(workdir, result.Reqs); err != nil {
+	reqs := filterProvisionedRequirements(result.Reqs)
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+
+	if err := Ensure(workdir, reqs); err != nil {
 		return nil, err
 	}
 
@@ -98,5 +103,43 @@ func miseBaseEnv() []string {
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"MISE_DATA_DIR=" + MiseDataDir,
 		"MISE_YES=1",
+	}
+}
+
+func filterProvisionedRequirements(reqs []Requirement) []Requirement {
+	filtered := make([]Requirement, 0, len(reqs))
+	for _, req := range reqs {
+		if shouldUseSystemTool(req) {
+			continue
+		}
+		filtered = append(filtered, req)
+	}
+	return filtered
+}
+
+func shouldUseSystemTool(req Requirement) bool {
+	switch req.Tool {
+	case "python", "rust":
+		if req.Version != "latest" {
+			return false
+		}
+		binary := "python3"
+		if req.Tool == "rust" {
+			binary = "rustc"
+		}
+		_, err := exec.LookPath(binary)
+		return err == nil
+	case "ruby", "java", "php":
+		if req.Version != "latest" {
+			return false
+		}
+		binary := req.Tool
+		if req.Tool == "php" {
+			binary = "php"
+		}
+		_, err := exec.LookPath(binary)
+		return err == nil
+	default:
+		return false
 	}
 }

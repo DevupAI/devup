@@ -1,0 +1,6 @@
+{
+  "name": "devup/php-http",
+  "description": "Tiny PHP benchmark service for devup vs Docker",
+  "type": "project",
+  "require": {}
+}

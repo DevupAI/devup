@@ -75,11 +75,11 @@ func Up(ctx context.Context, configPath, token string, verbose bool, quiet bool)
 		cmd := exec.CommandContext(ctx, "limactl", "start", "--tty=false", InstanceName)
 		if err := runCmd(cmd, quiet); err != nil {
 			if IsRunning() {
-			return ensureAgentRunning(ctx, token, verbose, quiet)
+				return ensureAgentRunning(ctx, token, verbose, quiet)
+			}
+			return err
 		}
-		return err
-	}
-	return ensureAgentRunning(ctx, token, verbose, quiet)
+		return ensureAgentRunning(ctx, token, verbose, quiet)
 	}
 	if os.IsNotExist(statErr) {
 		// No instance: create from YAML
@@ -298,6 +298,15 @@ func ShellCmd(ctx context.Context, cmd string) (string, error) {
 	c := exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "bash", "-lc", cmd)
 	out, err := c.CombinedOutput()
 	return string(out), err
+}
+
+// ShellCmdStreaming runs a command in the VM and streams stdout/stderr to the
+// current process. Use for long-running setup commands where progress matters.
+func ShellCmdStreaming(ctx context.Context, cmd string) error {
+	c := exec.CommandContext(ctx, "limactl", "shell", "--tty=false", InstanceName, "bash", "-lc", cmd)
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	return c.Run()
 }
 
 // FindLimaConfig locates the devup.yaml Lima config by searching common relative paths.

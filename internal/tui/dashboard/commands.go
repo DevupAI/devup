@@ -51,6 +51,13 @@ func fetchHealthCmd(c *client.Client) tea.Cmd {
 	}
 }
 
+func fetchBenchCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		summary, err := loadBenchSummary(path)
+		return benchResultMsg{summary: summary, err: err}
+	}
+}
+
 // fetchLogsCmd fetches logs without follow
 func fetchLogsCmd(c *client.Client, jobID string) tea.Cmd {
 	return func() tea.Msg {
@@ -118,7 +125,7 @@ func downCmd(c *client.Client) tea.Cmd {
 }
 
 // startJobCmd parses command and mount, calls client.Start
-func startJobCmd(c *client.Client, cmdStr, mountStr string) tea.Cmd {
+func startJobCmd(c *client.Client, cmdStr, mountStr, profile string, shadow bool) tea.Cmd {
 	return func() tea.Msg {
 		cmdStr = strings.TrimSpace(cmdStr)
 		mountStr = strings.TrimSpace(mountStr)
@@ -148,8 +155,10 @@ func startJobCmd(c *client.Client, cmdStr, mountStr string) tea.Cmd {
 			Cmd:       cmd,
 			Env:       util.EnvMap(),
 			Cwd:       "",
-
+			Profile:   api.NormalizeProfile(profile),
 			Mounts:    []api.Mount{m},
+			Overlay:   shadow,
+			Shadow:    shadow,
 		}
 		jobID, err := c.Start(ctx, req)
 		return startResultMsg{jobID: jobID, err: err}
